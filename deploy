@@ -1,0 +1,35 @@
+#! /bin/bash
+
+source .env
+
+## PARSE TEMPLATE
+cp EFI/OC/config.plist.tpl EFI/OC/config.plist
+
+sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
+sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
+sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
+sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
+
+## MOUNT EFI
+sudo diskutil mount $EFI
+echo "EFI mounted"
+sleep 5
+
+
+## BACKUP EFI TO DESKTOP
+EFIVOLUME=$(df -h | awk -v efidisk="$EFI" '$1 == efidisk {print $9}')
+EPOCH=$(ruby -e 'puts Time.now.to_f')
+mv $EFIVOLUME/EFI ~/Desktop/EFI_$EPOCH
+echo "EFI backed up to ~/Desktop/EFI_$EPOCH"
+sleep 10
+
+## COPY EFI
+cp -R EFI $EFIVOLUME/
+echo "New EFI deployed"
+sleep 5
+
+## UNMOUNT EFI
+sudo diskutil unmount $EFI
+
+## CLEANUP
+rm EFI/OC/config.plist
