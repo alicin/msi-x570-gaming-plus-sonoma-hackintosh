@@ -19,7 +19,8 @@
 ### NOTES
 
 - Handoff, iMessage/Facetime works
-- Sleep and Virtualization doesn't work
+- Sleep works
+- Virtualization doesn't work because amd
 - Sidecar doesn't work either (Maybe with USB mapping?)
 - iGPU could be achieved with [NootedRed](https://github.com/ChefKissInc/NootedRed)
 - Post-Install Root Patch from OpenCore Legacy Patcher should be run after installation to enable WiFi
