@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-SONOMA_VERSION="${SONOMA_VERSION:-14.7.4}"
+SONOMA_VERSION="${SONOMA_VERSION:-14.8.4}"
 INSTALLER_APP="/Applications/Install macOS Sonoma.app"
 INSTALLER_VOL_NAME="Install macOS Sonoma"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -25,9 +25,15 @@ download_installer() {
     return
   fi
 
-  info "Downloading macOS Sonoma $SONOMA_VERSION (this may take a while)..."
-  softwareupdate --fetch-full-installer --full-installer-version "$SONOMA_VERSION" \
-    || die "Failed to download Sonoma $SONOMA_VERSION. Try a different version via SONOMA_VERSION=14.x.x sudo ./create-installer"
+  command -v mist &>/dev/null \
+    || die "'mist' not found. Install via: brew install mist-cli"
+
+  info "Downloading macOS Sonoma $SONOMA_VERSION via mist (this may take a while)..."
+  mist download installer "$SONOMA_VERSION" application \
+    --application-name "Install macOS Sonoma.app" \
+    --output-directory "/Applications" \
+    --force \
+    || die "Failed to download Sonoma $SONOMA_VERSION. Check available versions with: mist list installer"
   info "Download complete."
 }
 
@@ -35,9 +41,9 @@ download_installer() {
 pick_usb_disk() {
   info "Scanning for external disks..."
 
-  # Collect all external, physical disks
-  mapfile -t ext_disks < <(diskutil list external physical 2>/dev/null \
-    | grep '^/dev/disk' | awk '{print $1}')
+  # Collect all external, physical disks (mapfile not available in bash 3.2)
+  IFS=$'\n' read -r -d '' -a ext_disks < <(diskutil list external physical 2>/dev/null \
+    | grep '^/dev/disk' | awk '{print $1}'; printf '\0') || true
 
   if [[ ${#ext_disks[@]} -eq 0 ]]; then
     die "No external disk found. Plug in your USB drive and retry."
@@ -63,7 +69,8 @@ pick_usb_disk() {
   diskutil list "$USB_DEV"
   echo ""
   read -rp "WARNING: ALL DATA ON $USB_DISK WILL BE ERASED. Continue? [y/N]: " confirm
-  [[ "${confirm,,}" == "y" ]] || { echo "Aborted."; exit 0; }
+  confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+  [[ "$confirm_lower" == "y" ]] || { echo "Aborted."; exit 0; }
 }
 
 # ─── 3. Erase and prepare USB ──────────────────────────────────────────────────
