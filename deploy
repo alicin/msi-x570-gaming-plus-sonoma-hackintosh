@@ -1,4 +1,5 @@
 #! /bin/bash
+set -e
 
 source .env
 
@@ -6,30 +7,40 @@ source .env
 cp EFI/OC/config.plist.tpl EFI/OC/config.plist
 
 sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
-sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
-sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
-sed -i '' -e "s|{{BOARD_SERIAL}}|$BOARD_SERIAL|g" EFI/OC/config.plist
+sed -i '' -e "s|{{SERIAL}}|$SERIAL|g" EFI/OC/config.plist
+sed -i '' -e "s|{{UUID}}|$UUID|g" EFI/OC/config.plist
+sed -i '' -e "s|{{ROM}}|$ROM|g" EFI/OC/config.plist
 
 ## MOUNT EFI
-sudo diskutil mount $EFI
+diskutil mount "$EFI"
 echo "EFI mounted"
-sleep 5
+sleep 3
 
+## RESOLVE MOUNT POINT
+EFIVOLUME=$(df | awk -v efidisk="$EFI" '$1 == efidisk {print $NF}')
+if [ -z "$EFIVOLUME" ]; then
+  echo "ERROR: Could not determine EFI mount point. Aborting."
+  rm EFI/OC/config.plist
+  exit 1
+fi
+echo "EFI volume: $EFIVOLUME"
 
 ## BACKUP EFI TO DESKTOP
-EFIVOLUME=$(df -h | awk -v efidisk="$EFI" '$1 == efidisk {print $9}')
 EPOCH=$(ruby -e 'puts Time.now.to_f')
-mv $EFIVOLUME/EFI ~/Desktop/EFI_$EPOCH
-echo "EFI backed up to ~/Desktop/EFI_$EPOCH"
-sleep 10
+if [ -d "$EFIVOLUME/EFI" ]; then
+  mv "$EFIVOLUME/EFI" ~/Desktop/EFI_$EPOCH
+  echo "EFI backed up to ~/Desktop/EFI_$EPOCH"
+else
+  echo "No existing EFI on volume, skipping backup"
+fi
 
 ## COPY EFI
-cp -R EFI $EFIVOLUME/
+cp -R EFI "$EFIVOLUME/"
 echo "New EFI deployed"
-sleep 5
+sleep 3
 
 ## UNMOUNT EFI
-sudo diskutil unmount $EFI
+diskutil unmount "$EFI"
 
 ## CLEANUP
 rm EFI/OC/config.plist
