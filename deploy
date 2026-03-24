@@ -11,6 +11,59 @@ sed -i '' -e "s|{{SERIAL}}|$SERIAL|g" EFI/OC/config.plist
 sed -i '' -e "s|{{UUID}}|$UUID|g" EFI/OC/config.plist
 sed -i '' -e "s|{{ROM}}|$ROM|g" EFI/OC/config.plist
 
+## SELECT EFI PARTITION
+echo ""
+echo "Detecting EFI partitions..."
+echo ""
+
+EFI_PARTS=()
+CURRENT_DISK=""
+CURRENT_TYPE=""
+DISK_LINE_RE='^/dev/(disk[0-9]+) \(([^)]+)\)'
+
+while IFS= read -r line; do
+  if [[ "$line" =~ $DISK_LINE_RE ]]; then
+    CURRENT_DISK="${BASH_REMATCH[1]}"
+    CURRENT_TYPE="${BASH_REMATCH[2]}"
+  elif [[ -n "$CURRENT_DISK" ]] && echo "$line" | grep -qE "[[:space:]]EFI[[:space:]]"; then
+    PART_ID=$(echo "$line" | awk '{print $NF}')
+    PART_SIZE=$(echo "$line" | awk '{print $(NF-2), $(NF-1)}')
+    if [[ "$PART_ID" =~ ^disk[0-9]+s[0-9]+$ ]]; then
+      EFI_PARTS+=("$PART_ID|$CURRENT_TYPE|$CURRENT_DISK|$PART_SIZE")
+    fi
+  fi
+done < <(diskutil list)
+
+if [ "${#EFI_PARTS[@]}" -eq 0 ]; then
+  echo "ERROR: No EFI partitions found."
+  rm EFI/OC/config.plist
+  exit 1
+fi
+
+echo "Available EFI partitions:"
+echo ""
+for i in "${!EFI_PARTS[@]}"; do
+  IFS='|' read -r PART TYPE PARENT SIZE <<< "${EFI_PARTS[$i]}"
+  MEDIA=$(diskutil info "$PARENT" 2>/dev/null | awk -F':[[:space:]]+' '/Device \/ Media Name/{print $2; exit}')
+  printf "  %d)  /dev/%-10s  %-35s  %-20s  %s\n" \
+    "$((i+1))" "$PART" "${MEDIA:-Unknown}" "[$TYPE]" "$SIZE"
+done
+
+echo ""
+printf "Select partition [1-%d]: " "${#EFI_PARTS[@]}"
+read -r SELECTION
+
+if ! [[ "$SELECTION" =~ ^[0-9]+$ ]] || [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "${#EFI_PARTS[@]}" ]; then
+  echo "ERROR: Invalid selection."
+  rm EFI/OC/config.plist
+  exit 1
+fi
+
+IFS='|' read -r SELECTED_PART _ _ _ <<< "${EFI_PARTS[$((SELECTION-1))]}"
+EFI="/dev/$SELECTED_PART"
+echo "Selected: $EFI"
+echo ""
+
 ## MOUNT EFI
 diskutil mount "$EFI"
 echo "EFI mounted"
