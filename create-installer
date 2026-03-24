@@ -75,6 +75,9 @@ pick_usb_disk() {
 
 # ─── 3. Erase and prepare USB ──────────────────────────────────────────────────
 prepare_usb() {
+  info "Force-unmounting all volumes on $USB_DISK..."
+  diskutil unmountDisk force "$USB_DISK" 2>/dev/null || true
+
   info "Erasing $USB_DISK as GPT/HFS+..."
   diskutil eraseDisk JHFS+ "$INSTALLER_VOL_NAME" GPT "$USB_DISK" \
     || die "Failed to erase $USB_DISK"
