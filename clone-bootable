@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  echo "❌ $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
+}
+
+need_cmd diskutil
+need_cmd asr
+need_cmd rsync
+need_cmd awk
+need_cmd plutil
+need_cmd stat
+
+echo "== Physical disks =="
+diskutil list physical
+echo
+
+read -rp "Enter SOURCE whole disk identifier (example: disk2): " SRC_DISK
+read -rp "Enter DESTINATION whole disk identifier (example: disk3): " DST_DISK
+
+[[ "$SRC_DISK" =~ ^disk[0-9]+$ ]] || fail "Source must look like diskN"
+[[ "$DST_DISK" =~ ^disk[0-9]+$ ]] || fail "Destination must look like diskN"
+[[ "$SRC_DISK" != "$DST_DISK" ]] || fail "Source and destination must be different"
+
+diskutil info "/dev/$SRC_DISK" >/dev/null 2>&1 || fail "Source disk not found: /dev/$SRC_DISK"
+diskutil info "/dev/$DST_DISK" >/dev/null 2>&1 || fail "Destination disk not found: /dev/$DST_DISK"
+
+ROOT_DEV="$(diskutil info / | awk -F': *' '/Device Node/ {print $2}')"
+ROOT_WHOLE="$(diskutil info "$ROOT_DEV" | awk -F': *' '/Part of Whole/ {print $2}')"
+
+echo
+echo "Current boot volume device : $ROOT_DEV"
+echo "Current boot whole disk    : $ROOT_WHOLE"
+echo "Chosen source disk         : $SRC_DISK"
+echo "Chosen destination disk    : $DST_DISK"
+echo
+
+if [[ "$DST_DISK" == "$ROOT_WHOLE" ]]; then
+  fail "Destination is the currently booted disk. Refusing."
+fi
+
+echo "== Source disk info =="
+diskutil info "/dev/$SRC_DISK" | egrep 'Device Node|Media Name|Disk Size|Protocol|SMART|Solid State'
+echo
+echo "== Destination disk info =="
+diskutil info "/dev/$DST_DISK" | egrep 'Device Node|Media Name|Disk Size|Protocol|SMART|Solid State'
+echo
+
+read -rp "This will ERASE /dev/$DST_DISK completely. Type YES to continue: " CONFIRM
+[[ "$CONFIRM" == "YES" ]] || fail "Cancelled"
+
+TMPDIR="$(mktemp -d /tmp/hackclone.XXXXXX)"
+cleanup() {
+  set +e
+  [[ -n "${SRC_EFI_MOUNT:-}" ]] && diskutil unmount "$SRC_EFI_MOUNT" >/dev/null 2>&1 || true
+  [[ -n "${DST_EFI_MOUNT:-}" ]] && diskutil unmount "$DST_EFI_MOUNT" >/dev/null 2>&1 || true
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+echo
+echo "== Finding source system volume =="
+if [[ "$SRC_DISK" == "$ROOT_WHOLE" ]]; then
+  SRC_SYSTEM="/"
+  echo "Source is current boot disk, using / as source system volume."
+else
+  echo "Source is not the current boot disk."
+  echo "Mounted volumes on source disk:"
+  diskutil list "/dev/$SRC_DISK"
+  echo
+  read -rp "Enter the mounted SOURCE macOS system volume path (example: /Volumes/Macintosh HD): " SRC_SYSTEM
+  [[ -d "$SRC_SYSTEM" ]] || fail "Source system volume path not found: $SRC_SYSTEM"
+fi
+
+echo
+echo "== Erasing destination disk =="
+diskutil unmountDisk force "/dev/$DST_DISK" || true
+diskutil eraseDisk APFS CLONE GPT "/dev/$DST_DISK"
+
+echo
+echo "== Locating destination APFS volume =="
+DST_SYSTEM="$(diskutil info "/dev/${DST_DISK}s2" 2>/dev/null | awk -F': *' '/Mount Point/ {print $2}')"
+
+if [[ -z "${DST_SYSTEM:-}" || "$DST_SYSTEM" == "Not mounted" ]]; then
+  # Fallback: find first mounted volume named CLONE
+  DST_SYSTEM="$(mount | awk '/\/Volumes\/CLONE/ {print $3; exit}')"
+fi
+
+[[ -n "${DST_SYSTEM:-}" ]] || fail "Could not determine destination mounted APFS volume"
+
+echo "Destination system target: $DST_SYSTEM"
+
+echo
+echo "== Cloning macOS volume group with ASR =="
+echo "Source:      $SRC_SYSTEM"
+echo "Destination: $DST_SYSTEM"
+sudo asr restore --source "$SRC_SYSTEM" --target "$DST_SYSTEM" --erase --noprompt
+
+echo
+echo "== Finding EFI partitions =="
+SRC_EFI_PART="$(diskutil list "/dev/$SRC_DISK" | awk '/EFI/ {print $NF; exit}')"
+DST_EFI_PART="$(diskutil list "/dev/$DST_DISK" | awk '/EFI/ {print $NF; exit}')"
+
+[[ -n "${SRC_EFI_PART:-}" ]] || fail "Could not find source EFI partition"
+[[ -n "${DST_EFI_PART:-}" ]] || fail "Could not find destination EFI partition"
+
+echo "Source EFI partition      : $SRC_EFI_PART"
+echo "Destination EFI partition : $DST_EFI_PART"
+
+echo
+echo "== Mounting EFI partitions =="
+diskutil mount "$SRC_EFI_PART" >/dev/null
+diskutil mount "$DST_EFI_PART" >/dev/null
+
+SRC_EFI_MOUNT="$(diskutil info "$SRC_EFI_PART" | awk -F': *' '/Mount Point/ {print $2}')"
+DST_EFI_MOUNT="$(diskutil info "$DST_EFI_PART" | awk -F': *' '/Mount Point/ {print $2}')"
+
+[[ -d "$SRC_EFI_MOUNT" ]] || fail "Source EFI mount point missing"
+[[ -d "$DST_EFI_MOUNT" ]] || fail "Destination EFI mount point missing"
+
+echo "Source EFI mount      : $SRC_EFI_MOUNT"
+echo "Destination EFI mount : $DST_EFI_MOUNT"
+
+echo
+echo "== Copying EFI contents =="
+sudo rsync -aHAX --delete "$SRC_EFI_MOUNT"/ "$DST_EFI_MOUNT"/
+
+sync
+
+echo
+echo "✅ Clone completed."
+echo
+echo "Next steps:"
+echo "1. Reboot and use BIOS/UEFI boot picker."
+echo "2. Boot from the destination disk."
+echo "3. Confirm OpenCore appears and macOS boots."
+echo "4. Once confirmed, keep that disk untouched as your fallback."

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# ─── Config ────────────────────────────────────────────────────────────────────
+# ─── Flags ─────────────────────────────────────────────────────────────────────
 AUTO_YES=0
 EFI_ONLY=0
 for arg in "$@"; do
@@ -9,46 +9,95 @@ for arg in "$@"; do
   [[ "$arg" == "--efi-only" || "$arg" == "--opencore" ]] && EFI_ONLY=1
 done
 
-SONOMA_VERSION="${SONOMA_VERSION:-14.8.4}"
-INSTALLER_APP="/Applications/Install macOS Sonoma.app"
-INSTALLER_VOL_NAME="Install macOS Sonoma"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Load env vars for config.plist template substitution
-source "$SCRIPT_DIR/.env"
+# MACOS_NAME / MACOS_VERSION / INSTALLER_APP / INSTALLER_VOL_NAME are set by
+# pick_macos_version() at runtime; not hardcoded here.
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
-die() { echo "ERROR: $*" >&2; exit 1; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 require_root() {
   [[ $EUID -eq 0 ]] || die "This script must be run with sudo (sudo ./create-installer)"
 }
 
-# ─── 1. Download Sonoma installer ──────────────────────────────────────────────
-download_installer() {
-  if [[ -d "$INSTALLER_APP" ]]; then
-    info "Sonoma installer already present at: $INSTALLER_APP"
-    return
-  fi
-
+# ─── 1. Pick macOS installer version ───────────────────────────────────────────
+pick_macos_version() {
   command -v mist &>/dev/null \
     || die "'mist' not found. Install via: brew install mist-cli"
 
-  info "Downloading macOS Sonoma $SONOMA_VERSION via mist (this may take a while)..."
-  mist download installer "$SONOMA_VERSION" application \
-    --application-name "Install macOS Sonoma.app" \
+  info "Fetching available macOS installers (requires internet)..."
+  local mist_out
+  mist_out=$(mist list installer 2>&1) \
+    || die "Failed to query installer catalog. Check your internet connection."
+
+  # Parse table rows: lines containing a pipe and "macOS" (skips header/border lines)
+  local -a rows
+  IFS=$'\n' read -r -d '' -a rows < <(
+    printf '%s\n' "$mist_out" | grep '|' | grep -i 'macos'; printf '\0'
+  ) || true
+
+  local MACOS_VERSION MACOS_NAME
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    echo ""
+    echo "Could not parse installer list. Raw output:"
+    echo "$mist_out"
+    echo ""
+    read -rp "Enter macOS version to download (e.g. 14.8.4): " MACOS_VERSION
+    read -rp "Enter macOS name (e.g. Sonoma): "                 MACOS_NAME
+  else
+    echo ""
+    echo "Available macOS installers:"
+    for i in "${!rows[@]}"; do
+      printf "  [%d]  %s\n" "$((i+1))" \
+        "$(printf '%s' "${rows[$i]}" | tr -s ' ' | sed 's/^[[:space:]]*//')"
+    done
+    echo ""
+    local pick
+    while true; do
+      read -rp "Select installer [1-${#rows[@]}]: " pick
+      [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#rows[@]} )) && break
+      echo "  Invalid selection. Enter a number between 1 and ${#rows[@]}."
+    done
+
+    local chosen="${rows[$((pick-1))]}"
+    MACOS_VERSION=$(printf '%s' "$chosen" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    MACOS_NAME=$(printf '%s' "$chosen" \
+      | grep -oiE 'macOS[[:space:]]+[A-Za-z]+' | head -1 | awk '{print $NF}')
+  fi
+
+  [[ -n "$MACOS_VERSION" ]] || die "Could not determine macOS version."
+  [[ -n "$MACOS_NAME"    ]] || die "Could not determine macOS name."
+
+  # Export so all subsequent functions see them
+  INSTALLER_APP="/Applications/Install macOS ${MACOS_NAME}.app"
+  INSTALLER_VOL_NAME="Install macOS ${MACOS_NAME}"
+  export MACOS_NAME MACOS_VERSION INSTALLER_APP INSTALLER_VOL_NAME
+
+  info "Selected: macOS $MACOS_NAME $MACOS_VERSION"
+}
+
+# ─── 2. Download macOS installer ───────────────────────────────────────────────
+download_installer() {
+  if [[ -d "$INSTALLER_APP" ]]; then
+    info "Installer already present at: $INSTALLER_APP"
+    return
+  fi
+
+  info "Downloading macOS $MACOS_NAME $MACOS_VERSION via mist (this may take a while)..."
+  mist download installer "$MACOS_VERSION" application \
+    --application-name "Install macOS ${MACOS_NAME}.app" \
     --output-directory "/Applications" \
     --force \
-    || die "Failed to download Sonoma $SONOMA_VERSION. Check available versions with: mist list installer"
+    || die "Failed to download macOS $MACOS_NAME $MACOS_VERSION."
   info "Download complete."
 }
 
-# ─── 2. Identify USB target disk ──────────────────────────────────────────────
+# ─── 3. Identify target disk ───────────────────────────────────────────────────
 pick_usb_disk() {
   info "Scanning for external disks..."
 
-  # Collect all external, physical disks (mapfile not available in bash 3.2)
   IFS=$'\n' read -r -d '' -a ext_disks < <(diskutil list external physical 2>/dev/null \
     | grep '^/dev/disk' | awk '{print $1}'; printf '\0') || true
 
@@ -56,30 +105,45 @@ pick_usb_disk() {
     die "No external disk found. Plug in your USB drive and retry."
   fi
 
+  local USB_DEV_LOCAL
   if [[ ${#ext_disks[@]} -eq 1 ]]; then
-    USB_DEV="${ext_disks[0]}"
-    USB_DISK="${USB_DEV#/dev/}"
+    USB_DEV_LOCAL="${ext_disks[0]}"
+    info "One external disk found: $USB_DEV_LOCAL"
   else
     echo ""
-    echo "Multiple external disks detected:"
+    echo "Available external disks:"
     for i in "${!ext_disks[@]}"; do
-      echo "  [$i] ${ext_disks[$i]}"
-      diskutil info "${ext_disks[$i]}" | grep -E "Size|Media Name" | sed 's/^/       /'
+      local media size
+      media=$(diskutil info "${ext_disks[$i]}" 2>/dev/null \
+        | awk -F':[[:space:]]+' '/Device \/ Media Name/{print $2; exit}')
+      size=$(diskutil info "${ext_disks[$i]}" 2>/dev/null \
+        | awk -F':[[:space:]]+' '/Disk Size/{print $2; exit}')
+      printf "  [%d]  %-12s  %-40s  %s\n" \
+        "$((i+1))" "${ext_disks[$i]}" "${media:-Unknown}" "${size:---}"
     done
-    read -rp "Enter the number of the USB disk to use: " pick
-    USB_DEV="${ext_disks[$pick]}"
-    USB_DISK="${USB_DEV#/dev/}"
+    echo ""
+    local pick
+    while true; do
+      read -rp "Select disk [1-${#ext_disks[@]}]: " pick
+      [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#ext_disks[@]} )) && break
+      echo "  Invalid selection. Enter a number between 1 and ${#ext_disks[@]}."
+    done
+    USB_DEV_LOCAL="${ext_disks[$((pick-1))]}"
   fi
 
+  USB_DEV="$USB_DEV_LOCAL"
+  USB_DISK="${USB_DEV#/dev/}"
+
   echo ""
-  info "Target USB disk: $USB_DISK"
+  info "Target disk: $USB_DISK"
   diskutil list "$USB_DEV"
   echo ""
   if [[ $AUTO_YES -eq 1 ]]; then
     echo "WARNING: ALL DATA ON $USB_DISK WILL BE ERASED. (auto-confirmed via -y)"
   else
     read -rp "WARNING: ALL DATA ON $USB_DISK WILL BE ERASED. Continue? [y/N]: " confirm
-    confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+    local confirm_lower
+    confirm_lower=$(printf '%s' "$confirm" | tr '[:upper:]' '[:lower:]')
     [[ "$confirm_lower" == "y" ]] || { echo "Aborted."; exit 0; }
   fi
 }
@@ -104,7 +168,7 @@ prepare_usb() {
 
 # ─── 4. Create bootable installer ─────────────────────────────────────────────
 create_install_media() {
-  info "Creating bootable macOS Sonoma installer..."
+  info "Creating bootable macOS $MACOS_NAME installer..."
   info "Note: speed is limited by your USB drive's write bandwidth."
   echo ""
 
@@ -128,7 +192,7 @@ create_install_media() {
     # Written bytes — volume may be briefly absent while createinstallmedia erases it
     local written_kb=0
     local vol
-    for vol in "/Volumes/Install macOS Sonoma" "/Volumes/$INSTALLER_VOL_NAME"; do
+    for vol in "/Volumes/$INSTALLER_VOL_NAME" "/Volumes/Install macOS $MACOS_NAME"; do
       if [[ -d "$vol" ]]; then
         written_kb=$(df -k "$vol" 2>/dev/null | awk 'NR==2{print $3}' || echo 0)
         [[ $written_kb -gt 0 ]] && break
@@ -207,6 +271,11 @@ create_install_media() {
 
 # ─── 5. Populate config.plist from template ───────────────────────────────────
 generate_config_plist() {
+  [[ -f "$SCRIPT_DIR/.env" ]] \
+    || die ".env file not found at $SCRIPT_DIR/.env (needed for SMBIOS values)"
+  # shellcheck source=.env
+  source "$SCRIPT_DIR/.env"
+
   info "Generating config.plist from template..."
   cp "$SCRIPT_DIR/EFI/OC/config.plist.tpl" "$SCRIPT_DIR/EFI/OC/config.plist"
 
@@ -216,6 +285,7 @@ generate_config_plist() {
   sed -i '' -e "s|{{UUID}}|$UUID|g"                 "$SCRIPT_DIR/EFI/OC/config.plist"
 
   # Verify all placeholders were replaced
+  local remaining
   remaining=$(grep -o '{{[^}]*}}' "$SCRIPT_DIR/EFI/OC/config.plist" || true)
   if [[ -n "$remaining" ]]; then
     rm -f "$SCRIPT_DIR/EFI/OC/config.plist"
@@ -243,7 +313,7 @@ install_opencore() {
 
   info "Unmounting $USB_EFI_PART..."
   diskutil unmount force "$USB_EFI_PART" 2>/dev/null \
-    || sudo umount -f "$EFI_MOUNT" 2>/dev/null \
+    || umount -f "$EFI_MOUNT" 2>/dev/null \
     || true
   rmdir "$EFI_MOUNT" 2>/dev/null || true
 }
@@ -258,15 +328,12 @@ trap cleanup EXIT
 require_root
 
 if [[ $EFI_ONLY -eq 1 ]]; then
-  info "EFI-only mode: skipping download and USB prep, going straight to OpenCore install."
-  # Determine USB disk from the mounted "Install macOS Sonoma" volume
-  USB_DISK=$(df "/Volumes/Install macOS Sonoma" 2>/dev/null | awk 'NR==2{gsub(/s[0-9]+$/,"",$1); gsub(/^\/dev\//,"",$1); print $1}') \
-    || die "Cannot find 'Install macOS Sonoma' volume — is the USB plugged in?"
-  [[ -n "$USB_DISK" ]] || die "Could not determine USB disk from mounted volume."
-  info "Detected USB disk: $USB_DISK"
+  info "EFI-only mode: skipping download and USB prep."
+  pick_usb_disk
   generate_config_plist
   install_opencore
 else
+  pick_macos_version
   download_installer
   pick_usb_disk
   prepare_usb
@@ -276,5 +343,5 @@ else
 fi
 
 echo ""
-info "Done! Bootable macOS Sonoma USB with OpenCore is ready on $USB_DISK."
+info "Done! Bootable macOS ${MACOS_NAME:+$MACOS_NAME }USB with OpenCore is ready on $USB_DISK."
 info "Plug it into the x570 machine and boot from USB."
