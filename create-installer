@@ -2,6 +2,13 @@
 set -euo pipefail
 
 # ─── Config ────────────────────────────────────────────────────────────────────
+AUTO_YES=0
+EFI_ONLY=0
+for arg in "$@"; do
+  [[ "$arg" == "-y"         || "$arg" == "--yes"      ]] && AUTO_YES=1
+  [[ "$arg" == "--efi-only" || "$arg" == "--opencore" ]] && EFI_ONLY=1
+done
+
 SONOMA_VERSION="${SONOMA_VERSION:-14.8.4}"
 INSTALLER_APP="/Applications/Install macOS Sonoma.app"
 INSTALLER_VOL_NAME="Install macOS Sonoma"
@@ -68,29 +75,133 @@ pick_usb_disk() {
   info "Target USB disk: $USB_DISK"
   diskutil list "$USB_DEV"
   echo ""
-  read -rp "WARNING: ALL DATA ON $USB_DISK WILL BE ERASED. Continue? [y/N]: " confirm
-  confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
-  [[ "$confirm_lower" == "y" ]] || { echo "Aborted."; exit 0; }
+  if [[ $AUTO_YES -eq 1 ]]; then
+    echo "WARNING: ALL DATA ON $USB_DISK WILL BE ERASED. (auto-confirmed via -y)"
+  else
+    read -rp "WARNING: ALL DATA ON $USB_DISK WILL BE ERASED. Continue? [y/N]: " confirm
+    confirm_lower=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+    [[ "$confirm_lower" == "y" ]] || { echo "Aborted."; exit 0; }
+  fi
 }
 
 # ─── 3. Erase and prepare USB ──────────────────────────────────────────────────
 prepare_usb() {
-  info "Force-unmounting all volumes on $USB_DISK..."
-  diskutil unmountDisk force "$USB_DISK" 2>/dev/null || true
+  info "Setting up $USB_DISK..."
+  # eraseDisk creates the EFI + HFS+ partition table and formats HFS+ in one step.
+  # On some disks (e.g. Ventoy) it creates the partition table fine but fails at
+  # HFS+ formatting; in that case fall back to erasing just the data partition.
+  if diskutil eraseDisk JHFS+ "$INSTALLER_VOL_NAME" GPT "$USB_DISK" 2>/dev/null; then
+    info "Disk prepared."
+    return
+  fi
 
-  info "Erasing $USB_DISK as GPT/HFS+..."
-  diskutil eraseDisk JHFS+ "$INSTALLER_VOL_NAME" GPT "$USB_DISK" \
-    || die "Failed to erase $USB_DISK"
-  info "Disk erased."
+  info "Full erase failed; retrying by reformatting data partition only..."
+  local data_part="${USB_DISK}s2"
+  diskutil eraseVolume JHFS+ "$INSTALLER_VOL_NAME" "$data_part" \
+    || die "Failed to prepare $USB_DISK. Unplug, replug the USB drive, and retry."
+  info "Disk prepared."
 }
 
 # ─── 4. Create bootable installer ─────────────────────────────────────────────
 create_install_media() {
-  info "Creating bootable macOS Sonoma installer (this takes several minutes)..."
+  info "Creating bootable macOS Sonoma installer..."
+  info "Note: speed is limited by your USB drive's write bandwidth."
+  echo ""
+
+  # Total expected write size (in KB) — used for percentage
+  local total_kb
+  total_kb=$(du -sk "$INSTALLER_APP" 2>/dev/null | awk '{print $1}')
+
+  # Run createinstallmedia in background, capture its output
+  local logfile
+  logfile=$(mktemp /tmp/createinstallmedia.XXXXXX)
   "$INSTALLER_APP/Contents/Resources/createinstallmedia" \
     --volume "/Volumes/$INSTALLER_VOL_NAME" \
-    --nointeraction \
-    || die "createinstallmedia failed"
+    --nointeraction >"$logfile" 2>&1 &
+  local cim_pid=$!
+
+  # Progress monitor loop
+  local prev_kb=0 prev_t=$SECONDS
+  while kill -0 "$cim_pid" 2>/dev/null; do
+    sleep 2
+
+    # Written bytes — volume may be briefly absent while createinstallmedia erases it
+    local written_kb=0
+    local vol
+    for vol in "/Volumes/Install macOS Sonoma" "/Volumes/$INSTALLER_VOL_NAME"; do
+      if [[ -d "$vol" ]]; then
+        written_kb=$(df -k "$vol" 2>/dev/null | awk 'NR==2{print $3}' || echo 0)
+        [[ $written_kb -gt 0 ]] && break
+      fi
+    done
+
+    # Bandwidth (KB/s → MB/s)
+    local now=$SECONDS
+    local delta_t=$(( now - prev_t ))
+    local delta_kb=$(( written_kb - prev_kb ))
+    local speed="--.- MB/s"
+    if [[ $delta_t -gt 0 && $delta_kb -gt 0 ]]; then
+      speed=$(awk "BEGIN{printf \"%5.1f MB/s\", $delta_kb / $delta_t / 1024}")
+    fi
+    prev_kb=$written_kb
+    prev_t=$now
+
+    # Percentage
+    local pct=0
+    if [[ $total_kb -gt 0 && $written_kb -gt 0 ]]; then
+      pct=$(( written_kb * 100 / total_kb ))
+      (( pct > 100 )) && pct=100
+    fi
+
+    # Progress bar (50 chars wide)
+    local filled=$(( pct / 2 ))
+    local empty=$(( 50 - filled ))
+    local bar="" spaces="" i
+    for (( i=0; i<filled; i++ )); do bar="${bar}█"; done
+    for (( i=0; i<empty;  i++ )); do spaces="${spaces}░"; done
+
+    printf "\r  [%s%s] %3d%% | %s" "$bar" "$spaces" "$pct" "$speed"
+  done
+
+  # Check exit status
+  wait "$cim_pid"; local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    echo "--- createinstallmedia output ---"
+    cat "$logfile"
+    rm -f "$logfile"
+    die "createinstallmedia failed (exit $rc)"
+  fi
+  rm -f "$logfile"
+
+  # Final 100% bar
+  local fullbar=""
+  for (( i=0; i<50; i++ )); do fullbar="${fullbar}█"; done
+  printf "\r  [%s] 100%% | Done!                  \n" "$fullbar"
+
+  # ── Buffer-drain phase ──────────────────────────────────────────────────────
+  # createinstallmedia exits after writing to the page cache; macOS still needs
+  # to flush ~14 GB to the physical USB.  Watch iostat until writes drop to 0.
+  echo ""
+  info "Flushing write buffer to USB (do NOT unplug)..."
+  local idle_count=0
+  while true; do
+    # iostat -d -K gives KB/s; column 3 for disk2
+    local wkb
+    wkb=$(iostat -d -K "$USB_DISK" 1 2 2>/dev/null | awk 'NR==4{print $3}' || echo 0)
+    local wmb
+    wmb=$(awk "BEGIN{printf \"%.1f\", ${wkb:-0}/1024}")
+    printf "\r  Buffer flush: %6s MB/s written to USB  " "$wmb"
+    if [[ "${wkb:-0}" -le 100 ]]; then
+      (( idle_count++ ))
+      [[ $idle_count -ge 3 ]] && break
+    else
+      idle_count=0
+    fi
+    sleep 1
+  done
+  printf "\r  Buffer flush: complete.                       \n"
+
   info "Bootable installer created."
 }
 
@@ -117,23 +228,24 @@ generate_config_plist() {
 install_opencore() {
   # After createinstallmedia the disk is re-partitioned; EFI is diskXs1
   USB_EFI_PART="${USB_DISK}s1"
+  EFI_MOUNT="/Volumes/EFI_USB_OC"
 
   info "Mounting EFI partition $USB_EFI_PART..."
-  diskutil mount "$USB_EFI_PART" \
+  mkdir -p "$EFI_MOUNT"
+  # diskutil refuses to mount EFI on external disks; use mount_msdos directly
+  mount_msdos "/dev/${USB_EFI_PART}" "$EFI_MOUNT" \
     || die "Failed to mount EFI partition $USB_EFI_PART"
 
-  EFI_VOLUME=$(diskutil info "$USB_EFI_PART" | awk '/Mount Point/{print $3}')
-  [[ -n "$EFI_VOLUME" && -d "$EFI_VOLUME" ]] \
-    || die "Could not determine mount point for $USB_EFI_PART"
-
-  info "Copying OpenCore EFI to $EFI_VOLUME..."
-  # Remove any existing EFI folder to ensure a clean copy
-  rm -rf "$EFI_VOLUME/EFI"
-  cp -R "$SCRIPT_DIR/EFI" "$EFI_VOLUME/"
+  info "Copying OpenCore EFI to $EFI_MOUNT..."
+  rm -rf "$EFI_MOUNT/EFI"
+  cp -R "$SCRIPT_DIR/EFI" "$EFI_MOUNT/"
   info "OpenCore EFI installed."
 
   info "Unmounting $USB_EFI_PART..."
-  diskutil unmount "$USB_EFI_PART"
+  diskutil unmount force "$USB_EFI_PART" 2>/dev/null \
+    || sudo umount -f "$EFI_MOUNT" 2>/dev/null \
+    || true
+  rmdir "$EFI_MOUNT" 2>/dev/null || true
 }
 
 # ─── 7. Cleanup ───────────────────────────────────────────────────────────────
@@ -144,12 +256,24 @@ trap cleanup EXIT
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 require_root
-download_installer
-pick_usb_disk
-prepare_usb
-create_install_media
-generate_config_plist
-install_opencore
+
+if [[ $EFI_ONLY -eq 1 ]]; then
+  info "EFI-only mode: skipping download and USB prep, going straight to OpenCore install."
+  # Determine USB disk from the mounted "Install macOS Sonoma" volume
+  USB_DISK=$(df "/Volumes/Install macOS Sonoma" 2>/dev/null | awk 'NR==2{gsub(/s[0-9]+$/,"",$1); gsub(/^\/dev\//,"",$1); print $1}') \
+    || die "Cannot find 'Install macOS Sonoma' volume — is the USB plugged in?"
+  [[ -n "$USB_DISK" ]] || die "Could not determine USB disk from mounted volume."
+  info "Detected USB disk: $USB_DISK"
+  generate_config_plist
+  install_opencore
+else
+  download_installer
+  pick_usb_disk
+  prepare_usb
+  create_install_media
+  generate_config_plist
+  install_opencore
+fi
 
 echo ""
 info "Done! Bootable macOS Sonoma USB with OpenCore is ready on $USB_DISK."
